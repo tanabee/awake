@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# awake — keep the Mac awake even with the lid closed.
+#
+# Usage:
+#   awake            # run in the foreground; Ctrl+C restores sleep and exits.
+#
+# How it works:
+#   - `sudo pmset -a disablesleep 1` disables clamshell sleep.
+#   - `caffeinate -is` also prevents system idle sleep while running.
+#   - A trap on INT/TERM/HUP/EXIT always restores pmset back to 0.
+
+set -u
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "awake: macOS only" >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  -h|--help)
+    cat <<'USAGE'
+awake — keep the Mac awake even with the lid closed
+
+Usage:
+  awake            Run in the foreground. Ctrl+C to release and exit.
+  awake -h|--help  Show this help.
+
+Behavior:
+  - Disables clamshell sleep via `sudo pmset -a disablesleep 1`
+  - Prevents system idle sleep via `caffeinate -is`
+  - Always restores pmset to 0 on exit
+USAGE
+    exit 0
+    ;;
+esac
+
+CAFFEINATE_PID=""
+DISABLED_SLEEP=0
+
+cleanup() {
+  trap - INT TERM HUP EXIT
+
+  if [[ -n "$CAFFEINATE_PID" ]] && kill -0 "$CAFFEINATE_PID" 2>/dev/null; then
+    kill "$CAFFEINATE_PID" 2>/dev/null || true
+    wait "$CAFFEINATE_PID" 2>/dev/null || true
+  fi
+
+  if [[ "$DISABLED_SLEEP" -eq 1 ]]; then
+    echo ""
+    echo "awake: restoring sleep settings (sudo pmset -a disablesleep 0)"
+    sudo pmset -a disablesleep 0 || echo "awake: failed to restore pmset. Run manually: sudo pmset -a disablesleep 0" >&2
+  fi
+}
+
+trap cleanup INT TERM HUP EXIT
+
+echo "awake: disabling sleep (sudo required)"
+if ! sudo pmset -a disablesleep 1; then
+  echo "awake: failed to configure pmset" >&2
+  exit 1
+fi
+DISABLED_SLEEP=1
+
+caffeinate -is &
+CAFFEINATE_PID=$!
+
+echo "awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID)"
+echo "awake: the Mac will stay awake with the lid closed. Press Ctrl+C to release and exit."
+
+# Block until caffeinate exits (normally via the cleanup trap on Ctrl+C).
+while kill -0 "$CAFFEINATE_PID" 2>/dev/null; do
+  wait "$CAFFEINATE_PID" 2>/dev/null
+done
