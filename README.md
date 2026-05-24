@@ -65,11 +65,12 @@ The symlink keeps pointing at the latest script — no re-linking needed.
 ```bash
 rm ~/.local/bin/awake
 rm -rf ~/.local/share/awake   # only if you used the curl installer
+rm -rf ~/.local/state/awake   # PID file and logs (background mode)
 ```
 
 ## Usage
 
-Start it in the foreground:
+### Foreground
 
 ```bash
 awake
@@ -79,7 +80,21 @@ You'll be prompted for your `sudo` password. Once the "running" message appears,
 
 When you're done, open the lid, return to the terminal where `awake` is running, and press **Ctrl+C**. The script restores the original sleep settings on exit.
 
-Show help:
+### Background
+
+Run detached from the current shell — useful when you want to close the terminal:
+
+```bash
+awake start      # primes sudo, then runs in the background
+awake status     # check whether it's running (PID, uptime, pmset state)
+awake stop       # stop it; sleep settings are restored automatically
+```
+
+State is kept under `~/.local/state/awake/` (`awake.pid`, `awake.log`). Override with `AWAKE_STATE_DIR=…`.
+
+`awake status` also reports `pmset disablesleep`. If it shows `1` while no awake process is tracked (e.g. a previous run was `kill -9`'d), restore manually with `sudo pmset -a disablesleep 0`.
+
+### Help
 
 ```bash
 awake --help

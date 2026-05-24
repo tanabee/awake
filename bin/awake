@@ -2,12 +2,11 @@
 # awake — keep the Mac awake even with the lid closed.
 #
 # Usage:
-#   awake            # run in the foreground; Ctrl+C restores sleep and exits.
-#
-# How it works:
-#   - `sudo pmset -a disablesleep 1` disables clamshell sleep.
-#   - `caffeinate -is` also prevents system idle sleep while running.
-#   - A trap on INT/TERM/HUP/EXIT always restores pmset back to 0.
+#   awake            Run in the foreground; Ctrl+C restores sleep and exits.
+#   awake start      Run in the background; persists across shell exit.
+#   awake status     Show whether awake is running and the pmset state.
+#   awake stop       Stop a background awake started with `awake start`.
+#   awake --help     Show help.
 
 set -u
 
@@ -16,58 +15,280 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
   exit 1
 fi
 
-case "${1:-}" in
-  -h|--help)
-    cat <<'USAGE'
+STATE_DIR="${AWAKE_STATE_DIR:-$HOME/.local/state/awake}"
+PID_FILE="$STATE_DIR/awake.pid"
+LOG_FILE="$STATE_DIR/awake.log"
+
+print_help() {
+  cat <<'USAGE'
 awake — keep the Mac awake even with the lid closed
 
 Usage:
   awake            Run in the foreground. Ctrl+C to release and exit.
+  awake start      Run in the background (detached). Survives shell exit.
+  awake status     Show running state, PID, uptime, and pmset disablesleep.
+  awake stop       Stop a background awake and restore sleep settings.
   awake -h|--help  Show this help.
+
+State files:
+  PID file: $HOME/.local/state/awake/awake.pid
+  Log file: $HOME/.local/state/awake/awake.log
+  (Override the directory via AWAKE_STATE_DIR.)
 
 Behavior:
   - Disables clamshell sleep via `sudo pmset -a disablesleep 1`
   - Prevents system idle sleep via `caffeinate -is`
-  - Always restores pmset to 0 on exit
+  - Always restores pmset to 0 on graceful exit (Ctrl+C, SIGTERM, etc.)
 USAGE
-    exit 0
-    ;;
-esac
+}
 
-CAFFEINATE_PID=""
-DISABLED_SLEEP=0
+pmset_disablesleep_value() {
+  # `pmset -a disablesleep N` shows up under "System-wide power settings:" as
+  # `SleepDisabled N`. Default is 0 when no override is set.
+  pmset -g 2>/dev/null | awk '/SleepDisabled/ {print $2; exit}'
+}
 
-cleanup() {
-  trap - INT TERM HUP EXIT
+is_running() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
 
-  if [[ -n "$CAFFEINATE_PID" ]] && kill -0 "$CAFFEINATE_PID" 2>/dev/null; then
-    kill "$CAFFEINATE_PID" 2>/dev/null || true
-    wait "$CAFFEINATE_PID" 2>/dev/null || true
-  fi
+read_pid() {
+  [[ -f "$PID_FILE" ]] || return 1
+  local pid
+  pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$pid"
+}
 
-  if [[ "$DISABLED_SLEEP" -eq 1 ]]; then
-    echo ""
-    echo "awake: restoring sleep settings (sudo pmset -a disablesleep 0)"
-    sudo pmset -a disablesleep 0 || echo "awake: failed to restore pmset. Run manually: sudo pmset -a disablesleep 0" >&2
+format_uptime() {
+  local secs="$1"
+  local d=$(( secs / 86400 ))
+  local h=$(( (secs % 86400) / 3600 ))
+  local m=$(( (secs % 3600) / 60 ))
+  local s=$(( secs % 60 ))
+  if (( d > 0 )); then
+    printf '%dd %02dh %02dm %02ds' "$d" "$h" "$m" "$s"
+  elif (( h > 0 )); then
+    printf '%dh %02dm %02ds' "$h" "$m" "$s"
+  elif (( m > 0 )); then
+    printf '%dm %02ds' "$m" "$s"
+  else
+    printf '%ds' "$s"
   fi
 }
 
-trap cleanup INT TERM HUP EXIT
+# ---------- foreground runner (the actual work loop) ----------
 
-echo "awake: disabling sleep (sudo required)"
-if ! sudo pmset -a disablesleep 1; then
-  echo "awake: failed to configure pmset" >&2
+run_foreground() {
+  local mode="${1:-attached}"  # attached | detached
+
+  CAFFEINATE_PID=""
+  DISABLED_SLEEP=0
+
+  cleanup() {
+    trap - INT TERM HUP EXIT
+
+    if [[ -n "$CAFFEINATE_PID" ]] && kill -0 "$CAFFEINATE_PID" 2>/dev/null; then
+      kill "$CAFFEINATE_PID" 2>/dev/null || true
+      wait "$CAFFEINATE_PID" 2>/dev/null || true
+    fi
+
+    if [[ "$DISABLED_SLEEP" -eq 1 ]]; then
+      echo ""
+      echo "awake: restoring sleep settings (sudo pmset -a disablesleep 0)"
+      sudo -n pmset -a disablesleep 0 \
+        || sudo pmset -a disablesleep 0 \
+        || echo "awake: failed to restore pmset. Run manually: sudo pmset -a disablesleep 0" >&2
+    fi
+
+    if [[ "$mode" == "detached" ]]; then
+      rm -f "$PID_FILE"
+    fi
+  }
+
+  trap cleanup INT TERM HUP EXIT
+
+  echo "awake: disabling sleep (sudo required)"
+  if ! sudo pmset -a disablesleep 1; then
+    echo "awake: failed to configure pmset" >&2
+    exit 1
+  fi
+  DISABLED_SLEEP=1
+
+  caffeinate -is &
+  CAFFEINATE_PID=$!
+
+  echo "awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID)"
+  echo "awake: the Mac will stay awake with the lid closed. Press Ctrl+C to release and exit."
+
+  while kill -0 "$CAFFEINATE_PID" 2>/dev/null; do
+    wait "$CAFFEINATE_PID" 2>/dev/null
+  done
+}
+
+# ---------- subcommands ----------
+
+cmd_start() {
+  mkdir -p "$STATE_DIR"
+
+  if pid="$(read_pid)" && is_running "$pid"; then
+    echo "awake: already running (PID=$pid). Use 'awake stop' first." >&2
+    exit 1
+  fi
+  rm -f "$PID_FILE"
+
+  # Prime sudo in the foreground so the background child can use the cached
+  # credential without prompting.
+  echo "awake: priming sudo (you may be asked for your password)"
+  sudo -v || { echo "awake: sudo authentication failed" >&2; exit 1; }
+
+  # Re-exec self in the background, detached from this shell.
+  nohup "$0" __detached >>"$LOG_FILE" 2>&1 </dev/null &
+  local child=$!
+  disown "$child" 2>/dev/null || true
+
+  # Wait briefly for the child to write its PID / start caffeinate.
+  local waited=0
+  while (( waited < 30 )); do
+    if pid="$(read_pid)" && is_running "$pid"; then
+      echo "awake: started in background (PID=$pid)"
+      echo "awake: logs -> $LOG_FILE"
+      echo "awake: stop with 'awake stop'"
+      return 0
+    fi
+    sleep 0.1
+    waited=$(( waited + 1 ))
+  done
+
+  echo "awake: background process did not start cleanly. Check $LOG_FILE" >&2
   exit 1
-fi
-DISABLED_SLEEP=1
+}
 
-caffeinate -is &
-CAFFEINATE_PID=$!
+cmd_detached() {
+  mkdir -p "$STATE_DIR"
+  echo "$$" > "$PID_FILE"
+  run_foreground detached
+}
 
-echo "awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID)"
-echo "awake: the Mac will stay awake with the lid closed. Press Ctrl+C to release and exit."
+cmd_status() {
+  local pid="" running=0
+  if pid="$(read_pid)" && is_running "$pid"; then
+    running=1
+  elif [[ -f "$PID_FILE" ]]; then
+    echo "awake: stale PID file at $PID_FILE (process not running)"
+  fi
 
-# Block until caffeinate exits (normally via the cleanup trap on Ctrl+C).
-while kill -0 "$CAFFEINATE_PID" 2>/dev/null; do
-  wait "$CAFFEINATE_PID" 2>/dev/null
-done
+  local disablesleep
+  disablesleep="$(pmset_disablesleep_value)"
+  disablesleep="${disablesleep:-unknown}"
+
+  if (( running )); then
+    local started_epoch now uptime started_human
+    # macOS ps prints lstart as: "Sat May 24 13:00:00 2026"
+    started_human="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//')"
+    started_epoch="$(ps -o lstart= -p "$pid" 2>/dev/null \
+      | sed 's/^ *//' \
+      | xargs -I{} date -j -f "%a %b %d %T %Y" "{}" +%s 2>/dev/null || true)"
+    now="$(date +%s)"
+
+    echo "awake: running (background)"
+    echo "  pid:                $pid"
+    if [[ -n "$started_human" ]]; then
+      echo "  started:            $started_human"
+    fi
+    if [[ -n "$started_epoch" ]]; then
+      uptime=$(( now - started_epoch ))
+      echo "  uptime:             $(format_uptime "$uptime")"
+    fi
+    echo "  pmset disablesleep: $disablesleep"
+    echo "  log:                $LOG_FILE"
+  else
+    echo "awake: not running (background)"
+    echo "  pmset disablesleep: $disablesleep"
+    if [[ "$disablesleep" == "1" ]]; then
+      echo "  warning: disablesleep is 1 but no awake process is tracked."
+      echo "  another tool may hold it, or a prior awake was force-killed."
+      echo "  inspect with: pmset -g assertions"
+      echo "  restore with: sudo pmset -a disablesleep 0"
+    fi
+  fi
+}
+
+cmd_stop() {
+  local pid
+  if ! pid="$(read_pid)"; then
+    echo "awake: no PID file at $PID_FILE — nothing to stop"
+    local disablesleep
+    disablesleep="$(pmset_disablesleep_value)"
+    if [[ "$disablesleep" == "1" ]]; then
+      echo "awake: warning: pmset disablesleep is still 1"
+      echo "  restore with: sudo pmset -a disablesleep 0"
+    fi
+    exit 1
+  fi
+
+  if ! is_running "$pid"; then
+    echo "awake: PID $pid not running — cleaning up stale PID file"
+    rm -f "$PID_FILE"
+    local disablesleep
+    disablesleep="$(pmset_disablesleep_value)"
+    if [[ "$disablesleep" == "1" ]]; then
+      echo "awake: warning: pmset disablesleep is still 1 (previous run may have been force-killed)"
+      echo "  restore with: sudo pmset -a disablesleep 0"
+    fi
+    exit 0
+  fi
+
+  echo "awake: stopping PID $pid"
+  kill -TERM "$pid" 2>/dev/null || { echo "awake: kill failed" >&2; exit 1; }
+
+  local waited=0
+  while (( waited < 50 )); do
+    if ! is_running "$pid"; then
+      echo "awake: stopped"
+      return 0
+    fi
+    sleep 0.1
+    waited=$(( waited + 1 ))
+  done
+
+  echo "awake: process did not exit after SIGTERM; sending SIGKILL"
+  kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+  local disablesleep
+  disablesleep="$(pmset_disablesleep_value)"
+  if [[ "$disablesleep" == "1" ]]; then
+    echo "awake: warning: cleanup trap did not run; pmset disablesleep is still 1"
+    echo "  restore with: sudo pmset -a disablesleep 0"
+  fi
+}
+
+# ---------- dispatch ----------
+
+case "${1:-}" in
+  -h|--help)
+    print_help
+    ;;
+  ""|fg|foreground)
+    run_foreground attached
+    ;;
+  start)
+    cmd_start
+    ;;
+  status)
+    cmd_status
+    ;;
+  stop)
+    cmd_stop
+    ;;
+  __detached)
+    # Internal: invoked by `awake start` via nohup. Not a public subcommand.
+    cmd_detached
+    ;;
+  *)
+    echo "awake: unknown command: $1" >&2
+    echo "Run 'awake --help' for usage." >&2
+    exit 2
+    ;;
+esac
