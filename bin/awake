@@ -184,22 +184,23 @@ cmd_status() {
   disablesleep="${disablesleep:-unknown}"
 
   if (( running )); then
-    local started_epoch now uptime started_human
-    # macOS ps prints lstart as: "Sat May 24 13:00:00 2026"
-    started_human="$(ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//')"
-    started_epoch="$(ps -o lstart= -p "$pid" 2>/dev/null \
-      | sed 's/^ *//' \
-      | xargs -I{} date -j -f "%a %b %d %T %Y" "{}" +%s 2>/dev/null || true)"
+    local started_epoch now uptime started_raw
+    # Force C locale so `ps` emits the parseable English form
+    # ("Sat May 24 13:00:00 2026") regardless of the user's LANG.
+    started_raw="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')"
+    if [[ -n "$started_raw" ]]; then
+      started_epoch="$(date -j -f "%a %b %d %T %Y" "$started_raw" +%s 2>/dev/null || true)"
+    fi
     now="$(date +%s)"
 
     echo "awake: running (background)"
     echo "  pid:                $pid"
-    if [[ -n "$started_human" ]]; then
-      echo "  started:            $started_human"
-    fi
     if [[ -n "$started_epoch" ]]; then
+      echo "  started:            $(date -r "$started_epoch" "+%Y-%m-%d %H:%M:%S %Z")"
       uptime=$(( now - started_epoch ))
       echo "  uptime:             $(format_uptime "$uptime")"
+    elif [[ -n "$started_raw" ]]; then
+      echo "  started:            $started_raw"
     fi
     echo "  pmset disablesleep: $disablesleep"
     echo "  log:                $LOG_FILE"
