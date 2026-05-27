@@ -4,6 +4,7 @@
 # Usage:
 #   awake                  Run in the foreground; Ctrl+C restores sleep and exits.
 #   awake -t 1h            Run in the foreground for 1 hour, then auto-stop.
+#   awake -b 20            Auto-stop when battery drops to 20% (on battery power).
 #   awake start            Run in the background; persists across shell exit.
 #   awake start -t 1h      Run in the background for 1 hour, then auto-stop.
 #   awake status           Show whether awake is running and the pmset state.
@@ -20,7 +21,10 @@ fi
 STATE_DIR="${AWAKE_STATE_DIR:-$HOME/.local/state/awake}"
 PID_FILE="$STATE_DIR/awake.pid"
 DEADLINE_FILE="$STATE_DIR/awake.deadline"
+BATTERY_FILE="$STATE_DIR/awake.battery"
 LOG_FILE="$STATE_DIR/awake.log"
+
+BATTERY_POLL_SECS=60
 
 print_help() {
   cat <<'USAGE'
@@ -29,9 +33,10 @@ awake — keep the Mac awake even with the lid closed
 Usage:
   awake                  Run in the foreground. Ctrl+C to release and exit.
   awake -t DURATION      Run in the foreground for DURATION, then auto-stop.
+  awake -b PERCENT       Auto-stop when battery drops to PERCENT% (on battery).
   awake start            Run in the background (detached). Survives shell exit.
-  awake start -t DURATION
-                         Run in the background for DURATION, then auto-stop.
+  awake start -t DURATION -b PERCENT
+                         Run in the background with a time/battery limit.
   awake status           Show running state, PID, uptime, and pmset disablesleep.
   awake stop             Stop a background awake and restore sleep settings.
   awake -h|--help        Show this help.
@@ -40,9 +45,16 @@ Duration format (-t / --timeout):
   Combine units h/m/s, e.g. 1h, 30m, 45s, 1h30m, 2h15m30s.
   A bare integer is treated as seconds: `-t 3600` == `-t 1h`.
 
+Battery threshold (-b / --battery):
+  Integer 1-99. Auto-stops when battery percentage drops to or below this
+  value while on battery power. Checks every 60s. Skipped while on AC power.
+
+  -t and -b may be combined; whichever condition fires first stops awake.
+
 State files:
   PID file:      $HOME/.local/state/awake/awake.pid
   Deadline file: $HOME/.local/state/awake/awake.deadline
+  Battery file:  $HOME/.local/state/awake/awake.battery
   Log file:      $HOME/.local/state/awake/awake.log
   (Override the directory via AWAKE_STATE_DIR.)
 
@@ -51,6 +63,39 @@ Behavior:
   - Prevents system idle sleep via `caffeinate -is`
   - Always restores pmset to 0 on graceful exit (Ctrl+C, SIGTERM, timeout, etc.)
 USAGE
+}
+
+parse_battery_threshold() {
+  local input="${1%\%}"  # tolerate a trailing '%' (e.g. `-b 20%`)
+  if [[ ! "$input" =~ ^[0-9]+$ ]]; then
+    return 1
+  fi
+  if (( input < 1 || input > 99 )); then
+    return 1
+  fi
+  printf '%s' "$input"
+}
+
+# Read current battery percentage (integer 0-100). Empty string if unavailable
+# (e.g. desktop Mac without a battery).
+battery_percent() {
+  pmset -g batt 2>/dev/null | awk '
+    match($0, /[0-9]+%/) {
+      pct = substr($0, RSTART, RLENGTH - 1)
+      print pct
+      exit
+    }
+  '
+}
+
+# "ac" if currently on wall power, "battery" if discharging, "" if unknown.
+power_source() {
+  pmset -g batt 2>/dev/null | awk '
+    /Now drawing from/ {
+      if (index($0, "AC Power")) { print "ac"; exit }
+      if (index($0, "Battery Power")) { print "battery"; exit }
+    }
+  '
 }
 
 # Parse a duration like "1h30m", "45s", "2h", or a bare integer (seconds).
@@ -122,11 +167,13 @@ format_uptime() {
 # ---------- foreground runner (the actual work loop) ----------
 
 run_foreground() {
-  local mode="${1:-attached}"  # attached | detached
-  local timeout_secs="${2:-0}" # 0 = no timeout
+  local mode="${1:-attached}"     # attached | detached
+  local timeout_secs="${2:-0}"    # 0 = no timeout
+  local battery_threshold="${3:-0}" # 0 = no battery limit
 
   CAFFEINATE_PID=""
   TIMER_PID=""
+  BATTERY_PID=""
   DISABLED_SLEEP=0
 
   cleanup() {
@@ -135,6 +182,11 @@ run_foreground() {
     if [[ -n "$TIMER_PID" ]] && kill -0 "$TIMER_PID" 2>/dev/null; then
       kill "$TIMER_PID" 2>/dev/null || true
       wait "$TIMER_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "$BATTERY_PID" ]] && kill -0 "$BATTERY_PID" 2>/dev/null; then
+      kill "$BATTERY_PID" 2>/dev/null || true
+      wait "$BATTERY_PID" 2>/dev/null || true
     fi
 
     if [[ -n "$CAFFEINATE_PID" ]] && kill -0 "$CAFFEINATE_PID" 2>/dev/null; then
@@ -151,7 +203,7 @@ run_foreground() {
     fi
 
     if [[ "$mode" == "detached" ]]; then
-      rm -f "$PID_FILE" "$DEADLINE_FILE"
+      rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
     fi
   }
 
@@ -167,6 +219,8 @@ run_foreground() {
   caffeinate -is &
   CAFFEINATE_PID=$!
 
+  local parent=$$
+
   if (( timeout_secs > 0 )); then
     local deadline=$(( $(date +%s) + timeout_secs ))
     if [[ "$mode" == "detached" ]]; then
@@ -177,13 +231,47 @@ run_foreground() {
     # path identical to `awake stop` / Ctrl+C.
     (
       sleep "$timeout_secs"
-      kill -TERM "$$" 2>/dev/null || true
+      kill -TERM "$parent" 2>/dev/null || true
     ) &
     TIMER_PID=$!
-    echo "awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID, timeout=$(format_uptime "$timeout_secs"))"
-  else
-    echo "awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID)"
   fi
+
+  if (( battery_threshold > 0 )); then
+    if [[ "$mode" == "detached" ]]; then
+      echo "$battery_threshold" > "$BATTERY_FILE"
+    fi
+    # Battery monitor child: polls pmset; signals parent when on battery and
+    # at/below threshold. Skips polls while on AC power.
+    (
+      while sleep "$BATTERY_POLL_SECS"; do
+        local src pct
+        src="$(power_source)"
+        if [[ "$src" != "battery" ]]; then
+          continue
+        fi
+        pct="$(battery_percent)"
+        if [[ -z "$pct" ]]; then
+          continue
+        fi
+        if (( pct <= battery_threshold )); then
+          echo "awake: battery at ${pct}% (<= ${battery_threshold}%); stopping" >&2
+          kill -TERM "$parent" 2>/dev/null || true
+          exit 0
+        fi
+      done
+    ) &
+    BATTERY_PID=$!
+  fi
+
+  local startup_msg="awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID"
+  if (( timeout_secs > 0 )); then
+    startup_msg+=", timeout=$(format_uptime "$timeout_secs")"
+  fi
+  if (( battery_threshold > 0 )); then
+    startup_msg+=", battery<=${battery_threshold}%"
+  fi
+  startup_msg+=")"
+  echo "$startup_msg"
   echo "awake: the Mac will stay awake with the lid closed. Press Ctrl+C to release and exit."
 
   while kill -0 "$CAFFEINATE_PID" 2>/dev/null; do
@@ -195,23 +283,23 @@ run_foreground() {
 
 cmd_start() {
   local timeout_secs="${1:-0}"
+  local battery_threshold="${2:-0}"
   mkdir -p "$STATE_DIR"
 
   if pid="$(read_pid)" && is_running "$pid"; then
     echo "awake: already running (PID=$pid). Use 'awake stop' first." >&2
     exit 1
   fi
-  rm -f "$PID_FILE" "$DEADLINE_FILE"
+  rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
 
   # Prime sudo in the foreground so the background child can use the cached
   # credential without prompting.
   echo "awake: priming sudo (you may be asked for your password)"
   sudo -v || { echo "awake: sudo authentication failed" >&2; exit 1; }
 
-  # Re-exec self in the background, detached from this shell. The trailing
-  # arg is the timeout in seconds (0 = no timeout) so the child knows whether
-  # to arm its auto-stop timer.
-  nohup "$0" __detached "$timeout_secs" >>"$LOG_FILE" 2>&1 </dev/null &
+  # Re-exec self in the background, detached from this shell. Trailing args:
+  # __detached <timeout_secs> <battery_threshold> (0 = unset).
+  nohup "$0" __detached "$timeout_secs" "$battery_threshold" >>"$LOG_FILE" 2>&1 </dev/null &
   local child=$!
   disown "$child" 2>/dev/null || true
 
@@ -222,6 +310,9 @@ cmd_start() {
       echo "awake: started in background (PID=$pid)"
       if (( timeout_secs > 0 )); then
         echo "awake: will auto-stop after $(format_uptime "$timeout_secs")"
+      fi
+      if (( battery_threshold > 0 )); then
+        echo "awake: will auto-stop when battery drops to ${battery_threshold}% (on battery power)"
       fi
       echo "awake: logs -> $LOG_FILE"
       echo "awake: stop with 'awake stop'"
@@ -237,9 +328,10 @@ cmd_start() {
 
 cmd_detached() {
   local timeout_secs="${1:-0}"
+  local battery_threshold="${2:-0}"
   mkdir -p "$STATE_DIR"
   echo "$$" > "$PID_FILE"
-  run_foreground detached "$timeout_secs"
+  run_foreground detached "$timeout_secs" "$battery_threshold"
 }
 
 cmd_status() {
@@ -286,6 +378,15 @@ cmd_status() {
         fi
       fi
     fi
+    if [[ -f "$BATTERY_FILE" ]]; then
+      local threshold pct src
+      threshold="$(cat "$BATTERY_FILE" 2>/dev/null || true)"
+      if [[ "$threshold" =~ ^[0-9]+$ ]]; then
+        pct="$(battery_percent)"
+        src="$(power_source)"
+        echo "  battery threshold:  ${threshold}% (now ${pct:-?}%, source: ${src:-unknown})"
+      fi
+    fi
     echo "  pmset disablesleep: $disablesleep"
     echo "  log:                $LOG_FILE"
   else
@@ -315,7 +416,7 @@ cmd_stop() {
 
   if ! is_running "$pid"; then
     echo "awake: PID $pid not running — cleaning up stale PID file"
-    rm -f "$PID_FILE" "$DEADLINE_FILE"
+    rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
     local disablesleep
     disablesleep="$(pmset_disablesleep_value)"
     if [[ "$disablesleep" == "1" ]]; then
@@ -340,7 +441,7 @@ cmd_stop() {
 
   echo "awake: process did not exit after SIGTERM; sending SIGKILL"
   kill -KILL "$pid" 2>/dev/null || true
-  rm -f "$PID_FILE" "$DEADLINE_FILE"
+  rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
   local disablesleep
   disablesleep="$(pmset_disablesleep_value)"
   if [[ "$disablesleep" == "1" ]]; then
@@ -356,7 +457,9 @@ cmd_stop() {
 # -t/--timeout DURATION may appear before or after the subcommand.
 SUBCMD=""
 TIMEOUT_RAW=""
+BATTERY_RAW=""
 DETACHED_TIMEOUT_SECS=""
+DETACHED_BATTERY_THRESHOLD=""
 
 while (( $# > 0 )); do
   case "$1" in
@@ -381,6 +484,23 @@ while (( $# > 0 )); do
       TIMEOUT_RAW="${1#-t}"
       shift
       ;;
+    -b|--battery)
+      if (( $# < 2 )); then
+        echo "awake: $1 requires a PERCENT argument (integer 1-99)" >&2
+        exit 2
+      fi
+      BATTERY_RAW="$2"
+      shift 2
+      ;;
+    --battery=*)
+      BATTERY_RAW="${1#--battery=}"
+      shift
+      ;;
+    -b*)
+      # Allow `-b20` (no space).
+      BATTERY_RAW="${1#-b}"
+      shift
+      ;;
     fg|foreground|start|status|stop)
       if [[ -n "$SUBCMD" ]]; then
         echo "awake: unexpected extra argument: $1" >&2
@@ -391,10 +511,12 @@ while (( $# > 0 )); do
       ;;
     __detached)
       # Internal: invoked by `awake start` via nohup. Not a public subcommand.
-      # Expects: __detached <timeout_secs>
+      # Expects: __detached <timeout_secs> <battery_threshold>
       SUBCMD="__detached"
       shift
       DETACHED_TIMEOUT_SECS="${1:-0}"
+      shift || true
+      DETACHED_BATTERY_THRESHOLD="${1:-0}"
       shift || true
       ;;
     *)
@@ -413,12 +535,20 @@ if [[ -n "$TIMEOUT_RAW" ]]; then
   fi
 fi
 
+BATTERY_THRESHOLD=0
+if [[ -n "$BATTERY_RAW" ]]; then
+  if ! BATTERY_THRESHOLD="$(parse_battery_threshold "$BATTERY_RAW")"; then
+    echo "awake: invalid battery threshold: '$BATTERY_RAW' (use an integer 1-99, with or without %)" >&2
+    exit 2
+  fi
+fi
+
 case "$SUBCMD" in
   ""|fg|foreground)
-    run_foreground attached "$TIMEOUT_SECS"
+    run_foreground attached "$TIMEOUT_SECS" "$BATTERY_THRESHOLD"
     ;;
   start)
-    cmd_start "$TIMEOUT_SECS"
+    cmd_start "$TIMEOUT_SECS" "$BATTERY_THRESHOLD"
     ;;
   status)
     cmd_status
@@ -427,6 +557,6 @@ case "$SUBCMD" in
     cmd_stop
     ;;
   __detached)
-    cmd_detached "$DETACHED_TIMEOUT_SECS"
+    cmd_detached "$DETACHED_TIMEOUT_SECS" "$DETACHED_BATTERY_THRESHOLD"
     ;;
 esac

@@ -110,6 +110,18 @@ awake status           # shows remaining time and deadline
 
 When the timer fires, `awake` exits the same way as `awake stop` / Ctrl+C — the `pmset` cleanup trap always runs, so sleep settings are restored.
 
+### Battery limit (`-b` / `--battery`)
+
+Pass an integer percent (1–99) to auto-stop when the battery drops to or below that level. Checks every 60s. **Skipped while on AC power**, so charging won't trigger an unwanted stop.
+
+```bash
+awake -b 20             # foreground, stop when battery <= 20% (on battery)
+awake start -b 15       # background, same idea
+awake -t 8h -b 20       # combine: stop after 8h OR when battery <= 20%
+```
+
+`awake status` shows the threshold along with the current battery level and power source. Like timeout, the battery monitor signals SIGTERM to the main process so the standard cleanup path restores `pmset`.
+
 ### Help
 
 ```bash
