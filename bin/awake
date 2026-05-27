@@ -147,6 +147,72 @@ read_pid() {
   printf '%s' "$pid"
 }
 
+# Find any foreground awake instance (no PID file) by walking caffeinate
+# parents. Prints PIDs of matching awake processes, one per line.
+find_foreground_awake_pids() {
+  # Gather caffeinate PIDs from pmset assertions.
+  local caff_pids
+  caff_pids="$(pmset -g assertions 2>/dev/null \
+    | awk 'match($0, /pid [0-9]+\(caffeinate\)/) {
+        s = substr($0, RSTART + 4, RLENGTH - 4)
+        sub(/\(.*/, "", s)
+        print s
+      }' | sort -u)"
+  [[ -z "$caff_pids" ]] && return 0
+
+  local cpid ppid pcmd
+  local self_pid="$$"
+  while read -r cpid; do
+    [[ -z "$cpid" ]] && continue
+    ppid="$(ps -o ppid= -p "$cpid" 2>/dev/null | tr -d ' ')"
+    [[ -z "$ppid" || "$ppid" == "1" ]] && continue
+    pcmd="$(ps -o command= -p "$ppid" 2>/dev/null)"
+    # Match the awake script (run via `bash .../bin/awake` or executed directly).
+    # Skip the detached background mode (handled by PID file) and skip ourselves.
+    if [[ "$pcmd" == *"/awake"* || "$pcmd" == *" awake "* || "$pcmd" == *" awake" ]]; then
+      [[ "$pcmd" == *"__detached"* ]] && continue
+      [[ "$ppid" == "$self_pid" ]] && continue
+      printf '%s\n' "$ppid"
+    fi
+  done <<<"$caff_pids"
+}
+
+# Read elapsed running time (in seconds) for a PID. Uses `ps -o etime=`,
+# which emits `[[DD-]HH:]MM:SS` and avoids `date -f` (BSD date refuses to
+# parse some valid future years).
+process_uptime_secs() {
+  local pid="$1"
+  local raw
+  raw="$(ps -o etime= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')"
+  [[ -z "$raw" ]] && return 1
+
+  # Split optional `DD-` prefix.
+  local days=0 hms="$raw"
+  if [[ "$hms" == *-* ]]; then
+    days="${hms%%-*}"
+    hms="${hms#*-}"
+  fi
+
+  # `hms` is now `HH:MM:SS` or `MM:SS`. Split on `:`.
+  local IFS=:
+  local -a parts=($hms)
+  unset IFS
+  local h=0 m=0 s=0
+  case ${#parts[@]} in
+    3) h="${parts[0]}"; m="${parts[1]}"; s="${parts[2]}" ;;
+    2) m="${parts[0]}"; s="${parts[1]}" ;;
+    *) return 1 ;;
+  esac
+
+  # Strip leading zeros to avoid octal interpretation in arithmetic.
+  days=$(( 10#${days} ))
+  h=$(( 10#${h} ))
+  m=$(( 10#${m} ))
+  s=$(( 10#${s} ))
+
+  printf '%s' "$(( days * 86400 + h * 3600 + m * 60 + s ))"
+}
+
 format_uptime() {
   local secs="$1"
   local d=$(( secs / 86400 ))
@@ -347,23 +413,16 @@ cmd_status() {
   disablesleep="${disablesleep:-unknown}"
 
   if (( running )); then
-    local started_epoch now uptime started_raw
-    # Force C locale so `ps` emits the parseable English form
-    # ("Sat May 24 13:00:00 2026") regardless of the user's LANG.
-    started_raw="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null | awk '{$1=$1; print}')"
-    if [[ -n "$started_raw" ]]; then
-      started_epoch="$(date -j -f "%a %b %d %T %Y" "$started_raw" +%s 2>/dev/null || true)"
-    fi
+    local now uptime started_epoch
     now="$(date +%s)"
+    uptime="$(process_uptime_secs "$pid" || true)"
 
     echo "awake: running (background)"
     echo "  pid:                $pid"
-    if [[ -n "$started_epoch" ]]; then
+    if [[ -n "$uptime" ]]; then
+      started_epoch=$(( now - uptime ))
       echo "  started:            $(date -r "$started_epoch" "+%Y-%m-%d %H:%M:%S %Z")"
-      uptime=$(( now - started_epoch ))
       echo "  uptime:             $(format_uptime "$uptime")"
-    elif [[ -n "$started_raw" ]]; then
-      echo "  started:            $started_raw"
     fi
     if [[ -f "$DEADLINE_FILE" ]]; then
       local deadline remaining
@@ -390,13 +449,48 @@ cmd_status() {
     echo "  pmset disablesleep: $disablesleep"
     echo "  log:                $LOG_FILE"
   else
-    echo "awake: not running (background)"
-    echo "  pmset disablesleep: $disablesleep"
-    if [[ "$disablesleep" == "1" ]]; then
-      echo "  warning: disablesleep is 1 but no awake process is tracked."
-      echo "  another tool may hold it, or a prior awake was force-killed."
-      echo "  inspect with: pmset -g assertions"
-      echo "  restore with: sudo pmset -a disablesleep 0"
+    # No background awake. Look for foreground awake instances (no PID file).
+    local fg_pids
+    fg_pids="$(find_foreground_awake_pids)"
+
+    if [[ -n "$fg_pids" ]]; then
+      local fg_pid started_epoch now uptime fg_count=0
+      now="$(date +%s)"
+      # Count for header wording (singular vs plural).
+      local total
+      total="$(printf '%s\n' "$fg_pids" | grep -c .)"
+
+      if (( total == 1 )); then
+        echo "awake: running (foreground in another shell)"
+      else
+        echo "awake: running (foreground in $total other shells)"
+      fi
+
+      while read -r fg_pid; do
+        [[ -z "$fg_pid" ]] && continue
+        fg_count=$(( fg_count + 1 ))
+        if (( total > 1 )); then
+          echo "  --- instance $fg_count ---"
+        fi
+        echo "  pid:                $fg_pid"
+        uptime="$(process_uptime_secs "$fg_pid" || true)"
+        if [[ -n "$uptime" ]]; then
+          started_epoch=$(( now - uptime ))
+          echo "  started:            $(date -r "$started_epoch" "+%Y-%m-%d %H:%M:%S %Z")"
+          echo "  uptime:             $(format_uptime "$uptime")"
+        fi
+      done <<<"$fg_pids"
+      echo "  pmset disablesleep: $disablesleep"
+      echo "  stop with:          Ctrl+C in the shell that started it (or 'kill -TERM <pid>')"
+    else
+      echo "awake: not running (background)"
+      echo "  pmset disablesleep: $disablesleep"
+      if [[ "$disablesleep" == "1" ]]; then
+        echo "  warning: disablesleep is 1 but no awake process is tracked."
+        echo "  another tool may hold it, or a prior awake was force-killed."
+        echo "  inspect with: pmset -g assertions"
+        echo "  restore with: sudo pmset -a disablesleep 0"
+      fi
     fi
   fi
 }
