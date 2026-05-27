@@ -2,11 +2,13 @@
 # awake — keep the Mac awake even with the lid closed.
 #
 # Usage:
-#   awake            Run in the foreground; Ctrl+C restores sleep and exits.
-#   awake start      Run in the background; persists across shell exit.
-#   awake status     Show whether awake is running and the pmset state.
-#   awake stop       Stop a background awake started with `awake start`.
-#   awake --help     Show help.
+#   awake                  Run in the foreground; Ctrl+C restores sleep and exits.
+#   awake -t 1h            Run in the foreground for 1 hour, then auto-stop.
+#   awake start            Run in the background; persists across shell exit.
+#   awake start -t 1h      Run in the background for 1 hour, then auto-stop.
+#   awake status           Show whether awake is running and the pmset state.
+#   awake stop             Stop a background awake started with `awake start`.
+#   awake --help           Show help.
 
 set -u
 
@@ -17,6 +19,7 @@ fi
 
 STATE_DIR="${AWAKE_STATE_DIR:-$HOME/.local/state/awake}"
 PID_FILE="$STATE_DIR/awake.pid"
+DEADLINE_FILE="$STATE_DIR/awake.deadline"
 LOG_FILE="$STATE_DIR/awake.log"
 
 print_help() {
@@ -24,22 +27,60 @@ print_help() {
 awake — keep the Mac awake even with the lid closed
 
 Usage:
-  awake            Run in the foreground. Ctrl+C to release and exit.
-  awake start      Run in the background (detached). Survives shell exit.
-  awake status     Show running state, PID, uptime, and pmset disablesleep.
-  awake stop       Stop a background awake and restore sleep settings.
-  awake -h|--help  Show this help.
+  awake                  Run in the foreground. Ctrl+C to release and exit.
+  awake -t DURATION      Run in the foreground for DURATION, then auto-stop.
+  awake start            Run in the background (detached). Survives shell exit.
+  awake start -t DURATION
+                         Run in the background for DURATION, then auto-stop.
+  awake status           Show running state, PID, uptime, and pmset disablesleep.
+  awake stop             Stop a background awake and restore sleep settings.
+  awake -h|--help        Show this help.
+
+Duration format (-t / --timeout):
+  Combine units h/m/s, e.g. 1h, 30m, 45s, 1h30m, 2h15m30s.
+  A bare integer is treated as seconds: `-t 3600` == `-t 1h`.
 
 State files:
-  PID file: $HOME/.local/state/awake/awake.pid
-  Log file: $HOME/.local/state/awake/awake.log
+  PID file:      $HOME/.local/state/awake/awake.pid
+  Deadline file: $HOME/.local/state/awake/awake.deadline
+  Log file:      $HOME/.local/state/awake/awake.log
   (Override the directory via AWAKE_STATE_DIR.)
 
 Behavior:
   - Disables clamshell sleep via `sudo pmset -a disablesleep 1`
   - Prevents system idle sleep via `caffeinate -is`
-  - Always restores pmset to 0 on graceful exit (Ctrl+C, SIGTERM, etc.)
+  - Always restores pmset to 0 on graceful exit (Ctrl+C, SIGTERM, timeout, etc.)
 USAGE
+}
+
+# Parse a duration like "1h30m", "45s", "2h", or a bare integer (seconds).
+# Prints the total seconds to stdout on success; exits non-zero on parse error.
+parse_duration() {
+  local input="$1"
+  if [[ -z "$input" ]]; then
+    return 1
+  fi
+  # Bare integer = seconds.
+  if [[ "$input" =~ ^[0-9]+$ ]]; then
+    if (( input <= 0 )); then
+      return 1
+    fi
+    printf '%s' "$input"
+    return 0
+  fi
+  # Combined units. Each unit may appear at most once and must be in h/m/s order.
+  if [[ ! "$input" =~ ^([0-9]+h)?([0-9]+m)?([0-9]+s)?$ ]]; then
+    return 1
+  fi
+  local h="${BASH_REMATCH[1]%h}"
+  local m="${BASH_REMATCH[2]%m}"
+  local s="${BASH_REMATCH[3]%s}"
+  h="${h:-0}"; m="${m:-0}"; s="${s:-0}"
+  local total=$(( h * 3600 + m * 60 + s ))
+  if (( total <= 0 )); then
+    return 1
+  fi
+  printf '%s' "$total"
 }
 
 pmset_disablesleep_value() {
@@ -82,12 +123,19 @@ format_uptime() {
 
 run_foreground() {
   local mode="${1:-attached}"  # attached | detached
+  local timeout_secs="${2:-0}" # 0 = no timeout
 
   CAFFEINATE_PID=""
+  TIMER_PID=""
   DISABLED_SLEEP=0
 
   cleanup() {
     trap - INT TERM HUP EXIT
+
+    if [[ -n "$TIMER_PID" ]] && kill -0 "$TIMER_PID" 2>/dev/null; then
+      kill "$TIMER_PID" 2>/dev/null || true
+      wait "$TIMER_PID" 2>/dev/null || true
+    fi
 
     if [[ -n "$CAFFEINATE_PID" ]] && kill -0 "$CAFFEINATE_PID" 2>/dev/null; then
       kill "$CAFFEINATE_PID" 2>/dev/null || true
@@ -103,7 +151,7 @@ run_foreground() {
     fi
 
     if [[ "$mode" == "detached" ]]; then
-      rm -f "$PID_FILE"
+      rm -f "$PID_FILE" "$DEADLINE_FILE"
     fi
   }
 
@@ -119,7 +167,23 @@ run_foreground() {
   caffeinate -is &
   CAFFEINATE_PID=$!
 
-  echo "awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID)"
+  if (( timeout_secs > 0 )); then
+    local deadline=$(( $(date +%s) + timeout_secs ))
+    if [[ "$mode" == "detached" ]]; then
+      echo "$deadline" > "$DEADLINE_FILE"
+    fi
+    # Timer child: after the timeout, signal our parent (this shell) so the
+    # cleanup trap runs and pmset is restored. Using SIGTERM keeps the exit
+    # path identical to `awake stop` / Ctrl+C.
+    (
+      sleep "$timeout_secs"
+      kill -TERM "$$" 2>/dev/null || true
+    ) &
+    TIMER_PID=$!
+    echo "awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID, timeout=$(format_uptime "$timeout_secs"))"
+  else
+    echo "awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID)"
+  fi
   echo "awake: the Mac will stay awake with the lid closed. Press Ctrl+C to release and exit."
 
   while kill -0 "$CAFFEINATE_PID" 2>/dev/null; do
@@ -130,21 +194,24 @@ run_foreground() {
 # ---------- subcommands ----------
 
 cmd_start() {
+  local timeout_secs="${1:-0}"
   mkdir -p "$STATE_DIR"
 
   if pid="$(read_pid)" && is_running "$pid"; then
     echo "awake: already running (PID=$pid). Use 'awake stop' first." >&2
     exit 1
   fi
-  rm -f "$PID_FILE"
+  rm -f "$PID_FILE" "$DEADLINE_FILE"
 
   # Prime sudo in the foreground so the background child can use the cached
   # credential without prompting.
   echo "awake: priming sudo (you may be asked for your password)"
   sudo -v || { echo "awake: sudo authentication failed" >&2; exit 1; }
 
-  # Re-exec self in the background, detached from this shell.
-  nohup "$0" __detached >>"$LOG_FILE" 2>&1 </dev/null &
+  # Re-exec self in the background, detached from this shell. The trailing
+  # arg is the timeout in seconds (0 = no timeout) so the child knows whether
+  # to arm its auto-stop timer.
+  nohup "$0" __detached "$timeout_secs" >>"$LOG_FILE" 2>&1 </dev/null &
   local child=$!
   disown "$child" 2>/dev/null || true
 
@@ -153,6 +220,9 @@ cmd_start() {
   while (( waited < 30 )); do
     if pid="$(read_pid)" && is_running "$pid"; then
       echo "awake: started in background (PID=$pid)"
+      if (( timeout_secs > 0 )); then
+        echo "awake: will auto-stop after $(format_uptime "$timeout_secs")"
+      fi
       echo "awake: logs -> $LOG_FILE"
       echo "awake: stop with 'awake stop'"
       return 0
@@ -166,9 +236,10 @@ cmd_start() {
 }
 
 cmd_detached() {
+  local timeout_secs="${1:-0}"
   mkdir -p "$STATE_DIR"
   echo "$$" > "$PID_FILE"
-  run_foreground detached
+  run_foreground detached "$timeout_secs"
 }
 
 cmd_status() {
@@ -202,6 +273,19 @@ cmd_status() {
     elif [[ -n "$started_raw" ]]; then
       echo "  started:            $started_raw"
     fi
+    if [[ -f "$DEADLINE_FILE" ]]; then
+      local deadline remaining
+      deadline="$(cat "$DEADLINE_FILE" 2>/dev/null || true)"
+      if [[ "$deadline" =~ ^[0-9]+$ ]]; then
+        remaining=$(( deadline - now ))
+        echo "  auto-stop at:       $(date -r "$deadline" "+%Y-%m-%d %H:%M:%S %Z")"
+        if (( remaining > 0 )); then
+          echo "  remaining:          $(format_uptime "$remaining")"
+        else
+          echo "  remaining:          (deadline passed; stopping shortly)"
+        fi
+      fi
+    fi
     echo "  pmset disablesleep: $disablesleep"
     echo "  log:                $LOG_FILE"
   else
@@ -231,7 +315,7 @@ cmd_stop() {
 
   if ! is_running "$pid"; then
     echo "awake: PID $pid not running — cleaning up stale PID file"
-    rm -f "$PID_FILE"
+    rm -f "$PID_FILE" "$DEADLINE_FILE"
     local disablesleep
     disablesleep="$(pmset_disablesleep_value)"
     if [[ "$disablesleep" == "1" ]]; then
@@ -256,7 +340,7 @@ cmd_stop() {
 
   echo "awake: process did not exit after SIGTERM; sending SIGKILL"
   kill -KILL "$pid" 2>/dev/null || true
-  rm -f "$PID_FILE"
+  rm -f "$PID_FILE" "$DEADLINE_FILE"
   local disablesleep
   disablesleep="$(pmset_disablesleep_value)"
   if [[ "$disablesleep" == "1" ]]; then
@@ -267,15 +351,74 @@ cmd_stop() {
 
 # ---------- dispatch ----------
 
-case "${1:-}" in
-  -h|--help)
-    print_help
-    ;;
+# Extract a subcommand and -t/--timeout flag from arbitrary argv order.
+# Recognized subcommands: (empty)|fg|foreground|start|status|stop|__detached
+# -t/--timeout DURATION may appear before or after the subcommand.
+SUBCMD=""
+TIMEOUT_RAW=""
+DETACHED_TIMEOUT_SECS=""
+
+while (( $# > 0 )); do
+  case "$1" in
+    -h|--help)
+      print_help
+      exit 0
+      ;;
+    -t|--timeout)
+      if (( $# < 2 )); then
+        echo "awake: $1 requires a DURATION argument (e.g. 1h, 30m, 90s, 3600)" >&2
+        exit 2
+      fi
+      TIMEOUT_RAW="$2"
+      shift 2
+      ;;
+    --timeout=*)
+      TIMEOUT_RAW="${1#--timeout=}"
+      shift
+      ;;
+    -t*)
+      # Allow `-t1h` (no space).
+      TIMEOUT_RAW="${1#-t}"
+      shift
+      ;;
+    fg|foreground|start|status|stop)
+      if [[ -n "$SUBCMD" ]]; then
+        echo "awake: unexpected extra argument: $1" >&2
+        exit 2
+      fi
+      SUBCMD="$1"
+      shift
+      ;;
+    __detached)
+      # Internal: invoked by `awake start` via nohup. Not a public subcommand.
+      # Expects: __detached <timeout_secs>
+      SUBCMD="__detached"
+      shift
+      DETACHED_TIMEOUT_SECS="${1:-0}"
+      shift || true
+      ;;
+    *)
+      echo "awake: unknown argument: $1" >&2
+      echo "Run 'awake --help' for usage." >&2
+      exit 2
+      ;;
+  esac
+done
+
+TIMEOUT_SECS=0
+if [[ -n "$TIMEOUT_RAW" ]]; then
+  if ! TIMEOUT_SECS="$(parse_duration "$TIMEOUT_RAW")"; then
+    echo "awake: invalid duration: '$TIMEOUT_RAW' (use 1h, 30m, 45s, 1h30m, or a positive integer of seconds)" >&2
+    exit 2
+  fi
+fi
+
+case "$SUBCMD" in
   ""|fg|foreground)
-    run_foreground attached
+    run_foreground attached "$TIMEOUT_SECS"
     ;;
   start)
-    cmd_start
+    cmd_start "$TIMEOUT_SECS"
     ;;
   status)
     cmd_status
@@ -284,12 +427,6 @@ case "${1:-}" in
     cmd_stop
     ;;
   __detached)
-    # Internal: invoked by `awake start` via nohup. Not a public subcommand.
-    cmd_detached
-    ;;
-  *)
-    echo "awake: unknown command: $1" >&2
-    echo "Run 'awake --help' for usage." >&2
-    exit 2
+    cmd_detached "$DETACHED_TIMEOUT_SECS"
     ;;
 esac

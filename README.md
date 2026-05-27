@@ -90,9 +90,25 @@ awake status     # check whether it's running (PID, uptime, pmset state)
 awake stop       # stop it; sleep settings are restored automatically
 ```
 
-State is kept under `~/.local/state/awake/` (`awake.pid`, `awake.log`). Override with `AWAKE_STATE_DIR=…`.
+State is kept under `~/.local/state/awake/` (`awake.pid`, `awake.deadline`, `awake.log`). Override with `AWAKE_STATE_DIR=…`.
 
 `awake status` also reports `pmset disablesleep`. If it shows `1` while no awake process is tracked (e.g. a previous run was `kill -9`'d), restore manually with `sudo pmset -a disablesleep 0`.
+
+### Time limit (`-t` / `--timeout`)
+
+Pass a duration to auto-stop after a fixed time. Works in both foreground and background mode:
+
+```bash
+awake -t 1h            # foreground, stop after 1 hour
+awake -t 30m           # foreground, stop after 30 minutes
+awake -t 1h30m         # combined units (hours / minutes / seconds)
+awake -t 3600          # bare integer = seconds (== 1h)
+
+awake start -t 2h      # background, auto-stop after 2 hours
+awake status           # shows remaining time and deadline
+```
+
+When the timer fires, `awake` exits the same way as `awake stop` / Ctrl+C — the `pmset` cleanup trap always runs, so sleep settings are restored.
 
 ### Help
 
