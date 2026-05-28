@@ -495,28 +495,34 @@ cmd_status() {
   fi
 }
 
+# Force-restore pmset disablesleep to 0 if it is still 1. Used by `awake stop`
+# whenever the cleanup trap could not run (no PID file, stale PID, SIGKILL
+# fallback) so the user is never left with a Mac that refuses to sleep.
+restore_disablesleep_if_stuck() {
+  local reason="$1"
+  local disablesleep
+  disablesleep="$(pmset_disablesleep_value)"
+  [[ "$disablesleep" == "1" ]] || return 0
+
+  echo "awake: pmset disablesleep is still 1${reason:+ ($reason)}; restoring"
+  echo "awake: restoring sleep settings (sudo pmset -a disablesleep 0)"
+  sudo -n pmset -a disablesleep 0 \
+    || sudo pmset -a disablesleep 0 \
+    || echo "awake: failed to restore pmset. Run manually: sudo pmset -a disablesleep 0" >&2
+}
+
 cmd_stop() {
   local pid
   if ! pid="$(read_pid)"; then
     echo "awake: no PID file at $PID_FILE — nothing to stop"
-    local disablesleep
-    disablesleep="$(pmset_disablesleep_value)"
-    if [[ "$disablesleep" == "1" ]]; then
-      echo "awake: warning: pmset disablesleep is still 1"
-      echo "  restore with: sudo pmset -a disablesleep 0"
-    fi
+    restore_disablesleep_if_stuck "no tracked awake process"
     exit 1
   fi
 
   if ! is_running "$pid"; then
     echo "awake: PID $pid not running — cleaning up stale PID file"
     rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
-    local disablesleep
-    disablesleep="$(pmset_disablesleep_value)"
-    if [[ "$disablesleep" == "1" ]]; then
-      echo "awake: warning: pmset disablesleep is still 1 (previous run may have been force-killed)"
-      echo "  restore with: sudo pmset -a disablesleep 0"
-    fi
+    restore_disablesleep_if_stuck "previous run may have been force-killed"
     exit 0
   fi
 
@@ -536,12 +542,7 @@ cmd_stop() {
   echo "awake: process did not exit after SIGTERM; sending SIGKILL"
   kill -KILL "$pid" 2>/dev/null || true
   rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
-  local disablesleep
-  disablesleep="$(pmset_disablesleep_value)"
-  if [[ "$disablesleep" == "1" ]]; then
-    echo "awake: warning: cleanup trap did not run; pmset disablesleep is still 1"
-    echo "  restore with: sudo pmset -a disablesleep 0"
-  fi
+  restore_disablesleep_if_stuck "cleanup trap did not run"
 }
 
 # ---------- dispatch ----------
