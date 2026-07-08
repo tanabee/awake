@@ -59,9 +59,12 @@ State files:
   (Override the directory via AWAKE_STATE_DIR.)
 
 Behavior:
-  - Disables clamshell sleep via `sudo pmset -a disablesleep 1`
+  - Disables clamshell sleep via `pmset -a disablesleep 1` (sudo)
   - Prevents system idle sleep via `caffeinate -is`
-  - Always restores pmset to 0 on graceful exit (Ctrl+C, SIGTERM, timeout, etc.)
+  - sudo may prompt for a password once at startup. A root helper process
+    started with that single authentication restores `disablesleep 0` when
+    awake exits for any reason (Ctrl+C, SIGTERM, timeout, battery limit,
+    even SIGKILL) — no second sudo prompt at exit.
 USAGE
 }
 
@@ -240,6 +243,10 @@ run_foreground() {
   CAFFEINATE_PID=""
   TIMER_PID=""
   BATTERY_PID=""
+  HELPER_PID=""
+  HELPER_FIFO=""
+  HELPER_STATUS=""
+  HELPER_FD_OPEN=0
   DISABLED_SLEEP=0
 
   cleanup() {
@@ -262,7 +269,25 @@ run_foreground() {
 
     if [[ "$DISABLED_SLEEP" -eq 1 ]]; then
       echo ""
-      echo "awake: restoring sleep settings (sudo pmset -a disablesleep 0)"
+      echo "awake: restoring sleep settings (root helper; no sudo prompt)"
+    fi
+
+    # Closing our end of the FIFO delivers EOF to the root helper, which
+    # then runs `pmset -a disablesleep 0` with the privileges it already
+    # holds — no fresh sudo credential (and no password prompt) needed.
+    if [[ "$HELPER_FD_OPEN" -eq 1 ]]; then
+      exec 9>&-
+      HELPER_FD_OPEN=0
+    fi
+    if [[ -n "$HELPER_PID" ]]; then
+      wait "$HELPER_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$HELPER_FIFO" ]]; then
+      rm -f "$HELPER_FIFO" "$HELPER_STATUS"
+    fi
+
+    if [[ "$DISABLED_SLEEP" -eq 1 && "$(pmset_disablesleep_value)" == "1" ]]; then
+      echo "awake: root helper did not restore pmset; falling back to sudo" >&2
       sudo -n pmset -a disablesleep 0 \
         || sudo pmset -a disablesleep 0 \
         || echo "awake: failed to restore pmset. Run manually: sudo pmset -a disablesleep 0" >&2
@@ -275,15 +300,81 @@ run_foreground() {
 
   trap cleanup INT TERM HUP EXIT
 
-  echo "awake: disabling sleep (sudo required)"
-  if ! sudo pmset -a disablesleep 1; then
+  mkdir -p "$STATE_DIR"
+
+  # Root helper: a single sudo authentication covers both the enable now and
+  # the restore at exit. The helper enables disablesleep, then blocks reading
+  # a FIFO whose write end only this process holds. When this process exits
+  # for ANY reason — Ctrl+C, SIGTERM, timeout, battery limit, even SIGKILL —
+  # the FIFO hits EOF and the helper restores disablesleep=0 as root, so no
+  # sudo password is ever needed at exit.
+  HELPER_FIFO="$STATE_DIR/helper.$$.fifo"
+  HELPER_STATUS="$STATE_DIR/helper.$$.status"
+  rm -f "$HELPER_FIFO" "$HELPER_STATUS"
+  if ! mkfifo -m 600 "$HELPER_FIFO"; then
+    echo "awake: failed to create FIFO at $HELPER_FIFO" >&2
+    exit 1
+  fi
+  # Open our end read-write: O_RDWR on a FIFO never blocks, and holding a
+  # read end ourselves means writes to fd 9 can never raise SIGPIPE.
+  exec 9<>"$HELPER_FIFO"
+  HELPER_FD_OPEN=1
+
+  echo "awake: disabling sleep (sudo may ask for your password — once; exit never prompts)"
+  # `9>&-` keeps the helper from inheriting our write end (which would block
+  # its own EOF forever). Children below get the same treatment.
+  sudo bash -c '
+    fifo="$1" status="$2"
+    # Survive Ctrl+C / SIGTERM / SIGHUP aimed at the foreground process
+    # group: the helper must outlive awake to restore sleep settings.
+    trap "" INT TERM HUP
+    exec 0<"$fifo"
+    if ! pmset -a disablesleep 1; then
+      echo failed > "$status"
+      exit 1
+    fi
+    echo ok > "$status"
+    # Block until EOF (= awake exited, however it died). Lines written by
+    # awake carry state, e.g. the caffeinate PID to reap on abnormal exit.
+    caff=""
+    while read -r line; do
+      case "$line" in
+        caffeinate=*) caff="${line#caffeinate=}" ;;
+      esac
+    done
+    pmset -a disablesleep 0
+    if [ -n "$caff" ]; then
+      kill "$caff" 2>/dev/null || true
+    fi
+    echo "awake: sleep settings restored (pmset -a disablesleep 0)"
+    rm -f "$fifo" "$status"
+  ' _ "$HELPER_FIFO" "$HELPER_STATUS" 9>&- &
+  HELPER_PID=$!
+
+  # Wait for the helper to report the pmset result. This can take a while:
+  # sudo may be prompting for a password. Bail out if the helper dies first
+  # (auth failure, Ctrl+C at the prompt). A zombie (stat Z) counts as dead —
+  # we have not reaped it yet, so plain liveness checks would spin forever.
+  local pm_status="" helper_stat=""
+  while :; do
+    pm_status="$(cat "$HELPER_STATUS" 2>/dev/null || true)"
+    [[ -n "$pm_status" ]] && break
+    helper_stat="$(ps -o stat= -p "$HELPER_PID" 2>/dev/null | tr -d ' ')"
+    if [[ -z "$helper_stat" || "$helper_stat" == Z* ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ "$pm_status" != "ok" ]]; then
     echo "awake: failed to configure pmset" >&2
     exit 1
   fi
   DISABLED_SLEEP=1
 
-  caffeinate -is &
+  caffeinate -is 9>&- &
   CAFFEINATE_PID=$!
+  # Tell the helper which caffeinate to reap if we die without cleanup.
+  echo "caffeinate=$CAFFEINATE_PID" >&9
 
   local parent=$$
 
@@ -298,7 +389,7 @@ run_foreground() {
     (
       sleep "$timeout_secs"
       kill -TERM "$parent" 2>/dev/null || true
-    ) &
+    ) 9>&- &
     TIMER_PID=$!
   fi
 
@@ -325,7 +416,7 @@ run_foreground() {
           exit 0
         fi
       done
-    ) &
+    ) 9>&- &
     BATTERY_PID=$!
   fi
 

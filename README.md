@@ -76,9 +76,9 @@ rm -rf ~/.local/state/awake   # PID file and logs (background mode)
 awake
 ```
 
-You'll be prompted for your `sudo` password. Once the "running" message appears, you can close the lid — the Mac will stay awake.
+You'll be prompted for your `sudo` password — **only once, at startup**. Once the "running" message appears, you can close the lid — the Mac will stay awake.
 
-When you're done, open the lid, return to the terminal where `awake` is running, and press **Ctrl+C**. The script restores the original sleep settings on exit.
+When you're done, open the lid, return to the terminal where `awake` is running, and press **Ctrl+C**. The script restores the original sleep settings on exit, without asking for your password again.
 
 ### Background
 
@@ -92,7 +92,7 @@ awake stop       # stop it; sleep settings are restored automatically
 
 State is kept under `~/.local/state/awake/` (`awake.pid`, `awake.deadline`, `awake.log`). Override with `AWAKE_STATE_DIR=…`.
 
-`awake status` also reports `pmset disablesleep`. If it shows `1` while no awake process is tracked (e.g. a previous run was `kill -9`'d), restore manually with `sudo pmset -a disablesleep 0`.
+`awake status` also reports `pmset disablesleep`. If it shows `1` while no awake process is tracked (e.g. another tool holds it, or a run predating the root helper was force-killed), restore manually with `sudo pmset -a disablesleep 0`.
 
 ### Time limit (`-t` / `--timeout`)
 
@@ -108,7 +108,7 @@ awake start -t 2h      # background, auto-stop after 2 hours
 awake status           # shows remaining time and deadline
 ```
 
-When the timer fires, `awake` exits the same way as `awake stop` / Ctrl+C — the `pmset` cleanup trap always runs, so sleep settings are restored.
+When the timer fires, `awake` exits the same way as `awake stop` / Ctrl+C — sleep settings are restored automatically by the root helper (see below), with **no sudo password prompt** at the deadline. You can start `awake -t 8h`, walk away, and sleep settings will be back to normal when the timer fires.
 
 ### Battery limit (`-b` / `--battery`)
 
@@ -130,15 +130,15 @@ awake --help
 
 ## How it works
 
-1. `sudo pmset -a disablesleep 1` — disables clamshell (lid-close) sleep on both AC and battery power.
+1. A single `sudo` authentication at startup launches a small **root helper** process. The helper runs `pmset -a disablesleep 1` — disabling clamshell (lid-close) sleep on both AC and battery power — and then blocks on a FIFO held open by the main `awake` process.
 2. `caffeinate -is` — also prevents system idle sleep while the script is running.
-3. A `trap` on `INT` / `TERM` / `HUP` / `EXIT` always runs `sudo pmset -a disablesleep 0` on exit, so sleep behavior is restored even if you Ctrl+C or the shell closes.
+3. When `awake` exits for any reason — Ctrl+C, `awake stop`, `-t` timeout, `-b` battery limit, `SIGTERM`, even `kill -9` — the FIFO reaches EOF and the helper restores `pmset -a disablesleep 0` with the root privileges it already holds. Because the helper never needs a fresh `sudo` credential, **no password prompt appears at exit**, so timed runs release automatically even when you're away from the machine.
 
 ## Caveats
 
 - **Heat**: closing the lid traps heat in the chassis. Avoid sustained heavy CPU/GPU loads in clamshell mode for long periods.
 - **Battery**: with `-a` (both AC and battery), the Mac will not sleep on battery either. Plug in for long sessions.
-- **Force-killed**: if `awake` is killed with `SIGKILL` (`kill -9`) or the machine crashes, the cleanup trap won't run. Recover manually:
+- **Force-killed**: `kill -9` is handled — the root helper notices the FIFO EOF and restores sleep settings (and reaps the orphaned `caffeinate`). If the machine crashes outright, though, no process survives to clean up. Recover manually:
 
   ```bash
   sudo pmset -g | grep -i disablesleep   # check current state (1 = still disabled)
