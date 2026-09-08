@@ -5,6 +5,7 @@
 #   awake                  Run in the foreground; Ctrl+C restores sleep and exits.
 #   awake -t 1h            Run in the foreground for 1 hour, then auto-stop.
 #   awake -b 20            Auto-stop when battery drops to 20% (on battery power).
+#   awake -s               Auto-stop when the Mac stays hot for 3 minutes.
 #   awake start            Run in the background; persists across shell exit.
 #   awake start -t 1h      Run in the background for 1 hour, then auto-stop.
 #   awake status           Show whether awake is running and the pmset state.
@@ -22,9 +23,12 @@ STATE_DIR="${AWAKE_STATE_DIR:-$HOME/.local/state/awake}"
 PID_FILE="$STATE_DIR/awake.pid"
 DEADLINE_FILE="$STATE_DIR/awake.deadline"
 BATTERY_FILE="$STATE_DIR/awake.battery"
+SAFE_FILE="$STATE_DIR/awake.safe"
 LOG_FILE="$STATE_DIR/awake.log"
 
 BATTERY_POLL_SECS=60
+THERMAL_POLL_SECS=60
+THERMAL_HOT_SECS=180   # --safe: stop after this long at "serious" or worse
 
 print_help() {
   cat <<'USAGE'
@@ -34,9 +38,10 @@ Usage:
   awake                  Run in the foreground. Ctrl+C to release and exit.
   awake -t DURATION      Run in the foreground for DURATION, then auto-stop.
   awake -b PERCENT       Auto-stop when battery drops to PERCENT% (on battery).
+  awake -s               Auto-stop when the Mac stays hot for 3 minutes.
   awake start            Run in the background (detached). Survives shell exit.
-  awake start -t DURATION -b PERCENT
-                         Run in the background with a time/battery limit.
+  awake start -t DURATION -b PERCENT -s
+                         Run in the background with time/battery/thermal limits.
   awake status           Show running state, PID, uptime, and pmset disablesleep.
   awake stop             Stop a background awake and restore sleep settings.
   awake -h|--help        Show this help.
@@ -49,12 +54,20 @@ Battery threshold (-b / --battery):
   Integer 1-99. Auto-stops when battery percentage drops to or below this
   value while on battery power. Checks every 60s. Skipped while on AC power.
 
-  -t and -b may be combined; whichever condition fires first stops awake.
+Safe mode (-s / --safe):
+  Auto-stops when macOS thermal pressure stays at "serious" or worse for
+  3 minutes straight. Checks every 60s. Uses NSProcessInfo.thermalState, so
+  no extra tools or sudo are needed. Note that macOS already throttles and
+  protects the hardware on its own; -s just stops awake earlier so the Mac
+  is not kept awake while it is too hot to do useful work.
+
+  -t, -b and -s may be combined; whichever condition fires first stops awake.
 
 State files:
   PID file:      $HOME/.local/state/awake/awake.pid
   Deadline file: $HOME/.local/state/awake/awake.deadline
   Battery file:  $HOME/.local/state/awake/awake.battery
+  Safe file:     $HOME/.local/state/awake/awake.safe
   Log file:      $HOME/.local/state/awake/awake.log
   (Override the directory via AWAKE_STATE_DIR.)
 
@@ -64,7 +77,7 @@ Behavior:
   - sudo may prompt for a password once at startup. A root helper process
     started with that single authentication restores `disablesleep 0` when
     awake exits for any reason (Ctrl+C, SIGTERM, timeout, battery limit,
-    even SIGKILL) — no second sudo prompt at exit.
+    thermal limit, even SIGKILL) — no second sudo prompt at exit.
 USAGE
 }
 
@@ -99,6 +112,25 @@ power_source() {
       if (index($0, "Battery Power")) { print "battery"; exit }
     }
   '
+}
+
+# macOS thermal pressure as reported by NSProcessInfo.thermalState:
+# 0 = nominal, 1 = fair, 2 = serious, 3 = critical. Empty string if unavailable.
+THERMAL_SERIOUS=2
+
+thermal_state() {
+  osascript -l JavaScript -e 'ObjC.import("Foundation"); $.NSProcessInfo.processInfo.thermalState' 2>/dev/null \
+    | tr -d '[:space:]'
+}
+
+thermal_state_name() {
+  case "${1:-}" in
+    0) printf 'nominal' ;;
+    1) printf 'fair' ;;
+    2) printf 'serious' ;;
+    3) printf 'critical' ;;
+    *) printf 'unknown' ;;
+  esac
 }
 
 # Parse a duration like "1h30m", "45s", "2h", or a bare integer (seconds).
@@ -239,10 +271,12 @@ run_foreground() {
   local mode="${1:-attached}"     # attached | detached
   local timeout_secs="${2:-0}"    # 0 = no timeout
   local battery_threshold="${3:-0}" # 0 = no battery limit
+  local safe_mode="${4:-0}"         # 1 = stop when hot for THERMAL_HOT_SECS
 
   CAFFEINATE_PID=""
   TIMER_PID=""
   BATTERY_PID=""
+  THERMAL_PID=""
   HELPER_PID=""
   HELPER_FIFO=""
   HELPER_STATUS=""
@@ -260,6 +294,11 @@ run_foreground() {
     if [[ -n "$BATTERY_PID" ]] && kill -0 "$BATTERY_PID" 2>/dev/null; then
       kill "$BATTERY_PID" 2>/dev/null || true
       wait "$BATTERY_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "$THERMAL_PID" ]] && kill -0 "$THERMAL_PID" 2>/dev/null; then
+      kill "$THERMAL_PID" 2>/dev/null || true
+      wait "$THERMAL_PID" 2>/dev/null || true
     fi
 
     if [[ -n "$CAFFEINATE_PID" ]] && kill -0 "$CAFFEINATE_PID" 2>/dev/null; then
@@ -294,7 +333,7 @@ run_foreground() {
     fi
 
     if [[ "$mode" == "detached" ]]; then
-      rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
+      rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE" "$SAFE_FILE"
     fi
   }
 
@@ -305,7 +344,7 @@ run_foreground() {
   # Root helper: a single sudo authentication covers both the enable now and
   # the restore at exit. The helper enables disablesleep, then blocks reading
   # a FIFO whose write end only this process holds. When this process exits
-  # for ANY reason — Ctrl+C, SIGTERM, timeout, battery limit, even SIGKILL —
+  # for ANY reason — Ctrl+C, SIGTERM, timeout, battery/thermal limit, even SIGKILL —
   # the FIFO hits EOF and the helper restores disablesleep=0 as root, so no
   # sudo password is ever needed at exit.
   HELPER_FIFO="$STATE_DIR/helper.$$.fifo"
@@ -401,6 +440,7 @@ run_foreground() {
     # at/below threshold. Skips polls while on AC power.
     (
       while sleep "$BATTERY_POLL_SECS"; do
+        kill -0 "$parent" 2>/dev/null || exit 0
         local src pct
         src="$(power_source)"
         if [[ "$src" != "battery" ]]; then
@@ -420,12 +460,50 @@ run_foreground() {
     BATTERY_PID=$!
   fi
 
+  if (( safe_mode )); then
+    if [[ "$mode" == "detached" ]]; then
+      echo "1" > "$SAFE_FILE"
+    fi
+    # Thermal monitor child: polls thermal pressure; signals parent once it
+    # has stayed at "serious" or worse for THERMAL_HOT_SECS straight.
+    (
+      hot_since=""
+      while sleep "$THERMAL_POLL_SECS"; do
+        kill -0 "$parent" 2>/dev/null || exit 0
+        local state now
+        state="$(thermal_state)"
+        if [[ ! "$state" =~ ^[0-9]+$ ]]; then
+          continue
+        fi
+        if (( state < THERMAL_SERIOUS )); then
+          hot_since=""
+          continue
+        fi
+        now="$(date +%s)"
+        if [[ -z "$hot_since" ]]; then
+          hot_since="$now"
+          echo "awake: thermal pressure is $(thermal_state_name "$state"); will stop if it stays hot for $(format_uptime "$THERMAL_HOT_SECS")" >&2
+          continue
+        fi
+        if (( now - hot_since >= THERMAL_HOT_SECS )); then
+          echo "awake: thermal pressure has been serious or worse for $(format_uptime $(( now - hot_since ))) (now $(thermal_state_name "$state")); stopping" >&2
+          kill -TERM "$parent" 2>/dev/null || true
+          exit 0
+        fi
+      done
+    ) 9>&- &
+    THERMAL_PID=$!
+  fi
+
   local startup_msg="awake: running (PID=$$, caffeinate PID=$CAFFEINATE_PID"
   if (( timeout_secs > 0 )); then
     startup_msg+=", timeout=$(format_uptime "$timeout_secs")"
   fi
   if (( battery_threshold > 0 )); then
     startup_msg+=", battery<=${battery_threshold}%"
+  fi
+  if (( safe_mode )); then
+    startup_msg+=", safe"
   fi
   startup_msg+=")"
   echo "$startup_msg"
@@ -441,13 +519,14 @@ run_foreground() {
 cmd_start() {
   local timeout_secs="${1:-0}"
   local battery_threshold="${2:-0}"
+  local safe_mode="${3:-0}"
   mkdir -p "$STATE_DIR"
 
   if pid="$(read_pid)" && is_running "$pid"; then
     echo "awake: already running (PID=$pid). Use 'awake stop' first." >&2
     exit 1
   fi
-  rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
+  rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE" "$SAFE_FILE"
 
   # Prime sudo in the foreground so the background child can use the cached
   # credential without prompting.
@@ -455,8 +534,8 @@ cmd_start() {
   sudo -v || { echo "awake: sudo authentication failed" >&2; exit 1; }
 
   # Re-exec self in the background, detached from this shell. Trailing args:
-  # __detached <timeout_secs> <battery_threshold> (0 = unset).
-  nohup "$0" __detached "$timeout_secs" "$battery_threshold" >>"$LOG_FILE" 2>&1 </dev/null &
+  # __detached <timeout_secs> <battery_threshold> <safe_mode> (0 = unset).
+  nohup "$0" __detached "$timeout_secs" "$battery_threshold" "$safe_mode" >>"$LOG_FILE" 2>&1 </dev/null &
   local child=$!
   disown "$child" 2>/dev/null || true
 
@@ -470,6 +549,9 @@ cmd_start() {
       fi
       if (( battery_threshold > 0 )); then
         echo "awake: will auto-stop when battery drops to ${battery_threshold}% (on battery power)"
+      fi
+      if (( safe_mode )); then
+        echo "awake: will auto-stop if thermal pressure stays serious for $(format_uptime "$THERMAL_HOT_SECS")"
       fi
       echo "awake: logs -> $LOG_FILE"
       echo "awake: stop with 'awake stop'"
@@ -486,9 +568,10 @@ cmd_start() {
 cmd_detached() {
   local timeout_secs="${1:-0}"
   local battery_threshold="${2:-0}"
+  local safe_mode="${3:-0}"
   mkdir -p "$STATE_DIR"
   echo "$$" > "$PID_FILE"
-  run_foreground detached "$timeout_secs" "$battery_threshold"
+  run_foreground detached "$timeout_secs" "$battery_threshold" "$safe_mode"
 }
 
 cmd_status() {
@@ -536,6 +619,9 @@ cmd_status() {
         src="$(power_source)"
         echo "  battery threshold:  ${threshold}% (now ${pct:-?}%, source: ${src:-unknown})"
       fi
+    fi
+    if [[ -f "$SAFE_FILE" ]]; then
+      echo "  safe mode:          on (stop after $(format_uptime "$THERMAL_HOT_SECS") at serious; now $(thermal_state_name "$(thermal_state)"))"
     fi
     echo "  pmset disablesleep: $disablesleep"
     echo "  log:                $LOG_FILE"
@@ -612,7 +698,7 @@ cmd_stop() {
 
   if ! is_running "$pid"; then
     echo "awake: PID $pid not running — cleaning up stale PID file"
-    rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
+    rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE" "$SAFE_FILE"
     restore_disablesleep_if_stuck "previous run may have been force-killed"
     exit 0
   fi
@@ -632,20 +718,22 @@ cmd_stop() {
 
   echo "awake: process did not exit after SIGTERM; sending SIGKILL"
   kill -KILL "$pid" 2>/dev/null || true
-  rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE"
+  rm -f "$PID_FILE" "$DEADLINE_FILE" "$BATTERY_FILE" "$SAFE_FILE"
   restore_disablesleep_if_stuck "cleanup trap did not run"
 }
 
 # ---------- dispatch ----------
 
-# Extract a subcommand and -t/--timeout flag from arbitrary argv order.
+# Extract a subcommand and -t/-b/-s flags from arbitrary argv order.
 # Recognized subcommands: (empty)|fg|foreground|start|status|stop|__detached
 # -t/--timeout DURATION may appear before or after the subcommand.
 SUBCMD=""
 TIMEOUT_RAW=""
 BATTERY_RAW=""
+SAFE_MODE=0
 DETACHED_TIMEOUT_SECS=""
 DETACHED_BATTERY_THRESHOLD=""
+DETACHED_SAFE_MODE=""
 
 while (( $# > 0 )); do
   case "$1" in
@@ -687,6 +775,10 @@ while (( $# > 0 )); do
       BATTERY_RAW="${1#-b}"
       shift
       ;;
+    -s|--safe)
+      SAFE_MODE=1
+      shift
+      ;;
     fg|foreground|start|status|stop)
       if [[ -n "$SUBCMD" ]]; then
         echo "awake: unexpected extra argument: $1" >&2
@@ -697,12 +789,14 @@ while (( $# > 0 )); do
       ;;
     __detached)
       # Internal: invoked by `awake start` via nohup. Not a public subcommand.
-      # Expects: __detached <timeout_secs> <battery_threshold>
+      # Expects: __detached <timeout_secs> <battery_threshold> <safe_mode>
       SUBCMD="__detached"
       shift
       DETACHED_TIMEOUT_SECS="${1:-0}"
       shift || true
       DETACHED_BATTERY_THRESHOLD="${1:-0}"
+      shift || true
+      DETACHED_SAFE_MODE="${1:-0}"
       shift || true
       ;;
     *)
@@ -731,10 +825,10 @@ fi
 
 case "$SUBCMD" in
   ""|fg|foreground)
-    run_foreground attached "$TIMEOUT_SECS" "$BATTERY_THRESHOLD"
+    run_foreground attached "$TIMEOUT_SECS" "$BATTERY_THRESHOLD" "$SAFE_MODE"
     ;;
   start)
-    cmd_start "$TIMEOUT_SECS" "$BATTERY_THRESHOLD"
+    cmd_start "$TIMEOUT_SECS" "$BATTERY_THRESHOLD" "$SAFE_MODE"
     ;;
   status)
     cmd_status
@@ -743,6 +837,6 @@ case "$SUBCMD" in
     cmd_stop
     ;;
   __detached)
-    cmd_detached "$DETACHED_TIMEOUT_SECS" "$DETACHED_BATTERY_THRESHOLD"
+    cmd_detached "$DETACHED_TIMEOUT_SECS" "$DETACHED_BATTERY_THRESHOLD" "$DETACHED_SAFE_MODE"
     ;;
 esac
