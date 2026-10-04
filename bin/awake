@@ -11,8 +11,11 @@
 #   awake status           Show whether awake is running and the pmset state.
 #   awake stop             Stop a background awake started with `awake start`.
 #   awake --help           Show help.
+#   awake --version        Show version.
 
 set -u
+
+AWAKE_VERSION="0.2.0"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "awake: macOS only" >&2
@@ -45,6 +48,7 @@ Usage:
   awake status           Show running state, PID, uptime, and pmset disablesleep.
   awake stop             Stop a background awake and restore sleep settings.
   awake -h|--help        Show this help.
+  awake -v|--version     Show version.
 
 Duration format (-t / --timeout):
   Combine units h/m/s, e.g. 1h, 30m, 45s, 1h30m, 2h15m30s.
@@ -739,6 +743,10 @@ while (( $# > 0 )); do
   case "$1" in
     -h|--help)
       print_help
+      exit 0
+      ;;
+    -v|--version)
+      echo "awake $AWAKE_VERSION"
       exit 0
       ;;
     -t|--timeout)

@@ -47,7 +47,7 @@ AWAKE_HOME=~/src/awake AWAKE_BIN_DIR=~/bin \
 
 ```bash
 which awake
-awake --help
+awake --version
 ```
 
 ### Update
@@ -157,10 +157,11 @@ awake -t 8h -b 20 -s    # combine: whichever condition fires first stops awake
 
 `awake status` shows `safe mode: on` along with the current thermal state. Note that macOS already throttles and protects the hardware by itself; `-s` just stops keeping the Mac awake once it is too hot to do useful work.
 
-### Help
+### Help / Version
 
 ```bash
 awake --help
+awake --version   # or: awake -v
 ```
 
 ## How it works
