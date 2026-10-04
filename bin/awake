@@ -15,7 +15,7 @@
 
 set -u
 
-AWAKE_VERSION="0.2.0"
+AWAKE_VERSION="0.3.0"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "awake: macOS only" >&2
@@ -28,6 +28,10 @@ DEADLINE_FILE="$STATE_DIR/awake.deadline"
 BATTERY_FILE="$STATE_DIR/awake.battery"
 SAFE_FILE="$STATE_DIR/awake.safe"
 LOG_FILE="$STATE_DIR/awake.log"
+UPDATE_CHECK_FILE="$STATE_DIR/update-check"
+
+UPDATE_CHECK_INTERVAL_SECS=86400   # check for a new release at most once a day
+UPDATE_CHECK_URL="https://api.github.com/repos/tanabee/awake/tags"
 
 BATTERY_POLL_SECS=60
 THERMAL_POLL_SECS=60
@@ -270,6 +274,73 @@ format_uptime() {
 }
 
 # ---------- foreground runner (the actual work loop) ----------
+
+# ---------- update check ----------
+
+# Resolve $0 through symlinks so we can tell a Homebrew install (Cellar) from a
+# git clone + symlink install and suggest the matching upgrade command.
+script_real_path() {
+  local p="$0" target
+  while [[ -L "$p" ]]; do
+    target="$(readlink "$p")" || break
+    case "$target" in
+      /*) p="$target" ;;
+      *)  p="$(dirname "$p")/$target" ;;
+    esac
+  done
+  printf '%s\n' "$p"
+}
+
+upgrade_hint() {
+  case "$(script_real_path)" in
+    */Cellar/awake/*) echo "brew upgrade awake" ;;
+    *)                echo "git -C \"$(cd "$(dirname "$(script_real_path)")/.." && pwd -P)\" pull" ;;
+  esac
+}
+
+# Returns 0 if $1 is strictly newer than $2 (semver-ish, via sort -V).
+version_gt() {
+  [[ "$1" != "$2" ]] && [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" == "$1" ]]
+}
+
+# Fetch the latest tag in the background and cache it. Never blocks startup.
+refresh_update_cache() {
+  mkdir -p "$STATE_DIR"
+  # Touch first so an offline run does not retry on every invocation.
+  touch "$UPDATE_CHECK_FILE" 2>/dev/null || return 0
+  (
+    trap '' HUP INT TERM   # outlive the terminal / Ctrl+C; curl --max-time bounds it
+    latest="$(curl -fsSL --max-time 3 "$UPDATE_CHECK_URL" 2>/dev/null \
+      | grep -o '"name": *"v[0-9][0-9.]*"' \
+      | sed 's/.*"v\([0-9.]*\)"/\1/' \
+      | sort -V | tail -n1)"
+    if [[ -n "$latest" ]]; then
+      printf '%s\n' "$latest" > "$UPDATE_CHECK_FILE.tmp.$$" && mv -f "$UPDATE_CHECK_FILE.tmp.$$" "$UPDATE_CHECK_FILE"
+    fi
+  ) >/dev/null 2>&1 </dev/null &
+  disown $! 2>/dev/null || true
+}
+
+# Print a one-line upgrade notice to stderr if a newer release is cached.
+# Skipped when stderr is not a terminal, in CI, or with AWAKE_NO_UPDATE_CHECK=1.
+maybe_notify_update() {
+  [[ -n "${AWAKE_NO_UPDATE_CHECK:-}" || -n "${CI:-}" ]] && return 0
+  [[ -t 2 ]] || return 0
+  command -v curl >/dev/null 2>&1 || return 0
+
+  local now last=0 cached=""
+  now="$(date +%s)"
+  if [[ -f "$UPDATE_CHECK_FILE" ]]; then
+    last="$(stat -f %m "$UPDATE_CHECK_FILE" 2>/dev/null || echo 0)"
+    cached="$(head -n1 "$UPDATE_CHECK_FILE" 2>/dev/null || true)"
+  fi
+  if (( now - last >= UPDATE_CHECK_INTERVAL_SECS )); then
+    refresh_update_cache
+  fi
+  if [[ -n "$cached" ]] && version_gt "$cached" "$AWAKE_VERSION"; then
+    echo "awake: a new version is available ($AWAKE_VERSION -> $cached). Upgrade with: $(upgrade_hint)" >&2
+  fi
+}
 
 run_foreground() {
   local mode="${1:-attached}"     # attached | detached
@@ -833,12 +904,15 @@ fi
 
 case "$SUBCMD" in
   ""|fg|foreground)
+    maybe_notify_update
     run_foreground attached "$TIMEOUT_SECS" "$BATTERY_THRESHOLD" "$SAFE_MODE"
     ;;
   start)
+    maybe_notify_update
     cmd_start "$TIMEOUT_SECS" "$BATTERY_THRESHOLD" "$SAFE_MODE"
     ;;
   status)
+    maybe_notify_update
     cmd_status
     ;;
   stop)

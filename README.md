@@ -113,7 +113,7 @@ awake status     # check whether it's running (PID, uptime, pmset state)
 awake stop       # stop it; sleep settings are restored automatically
 ```
 
-State is kept under `~/.local/state/awake/` (`awake.pid`, `awake.deadline`, `awake.battery`, `awake.safe`, `awake.log`). Override with `AWAKE_STATE_DIR=…`.
+State is kept under `~/.local/state/awake/` (`awake.pid`, `awake.deadline`, `awake.battery`, `awake.safe`, `awake.log`, `update-check`). Override with `AWAKE_STATE_DIR=…`.
 
 `awake status` also reports `pmset disablesleep`. If it shows `1` while no awake process is tracked (e.g. another tool holds it, or a run predating the root helper was force-killed), restore manually with `sudo pmset -a disablesleep 0`.
 
@@ -162,6 +162,20 @@ awake -t 8h -b 20 -s    # combine: whichever condition fires first stops awake
 ```bash
 awake --help
 awake --version   # or: awake -v
+```
+
+### Update notifications
+
+`awake`, `awake start` and `awake status` check for a newer release at most once a day and print a one-line hint on stderr when one is available:
+
+```
+awake: a new version is available (0.2.0 -> 0.3.0). Upgrade with: brew upgrade awake
+```
+
+The check fetches the tag list from the GitHub API in the background (3-second timeout) and caches the result in `~/.local/state/awake/update-check`, so it never delays startup and does nothing when offline. The hint is suppressed when stderr is not a terminal or when `CI` is set. Disable it entirely with:
+
+```bash
+export AWAKE_NO_UPDATE_CHECK=1
 ```
 
 ## Releasing (maintainers)
