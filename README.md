@@ -11,7 +11,15 @@ A tiny shell script that combines `pmset` and `caffeinate` so you can close your
 
 ## Installation
 
-### Option 1: git clone + symlink (recommended)
+### Option 1: Homebrew (recommended)
+
+```bash
+brew install tanabee/tap/awake
+```
+
+On Homebrew 7+, third-party taps must be trusted first; if prompted, run `brew trust tanabee/tap` and retry.
+
+### Option 2: git clone + symlink
 
 ```bash
 git clone https://github.com/tanabee/awake.git ~/.local/share/awake
@@ -20,13 +28,13 @@ ln -s ~/.local/share/awake/bin/awake ~/.local/bin/awake
 
 Pick different paths if you prefer — for example clone into `~/src/awake` and link to `~/bin/awake`. Just make sure the symlink target directory is on your `PATH`.
 
-### Option 2: curl (one-liner)
+### Option 3: curl (one-liner)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/tanabee/awake/main/install.sh | bash
 ```
 
-This runs the same steps as Option 1 (clone into `~/.local/share/awake`, symlink into `~/.local/bin/awake`).
+This runs the same steps as Option 2 (clone into `~/.local/share/awake`, symlink into `~/.local/bin/awake`).
 
 Override paths with env vars if you want:
 
@@ -43,6 +51,12 @@ awake --help
 ```
 
 ### Update
+
+If you installed with **Homebrew**:
+
+```bash
+brew upgrade awake
+```
 
 If you installed with **git clone + symlink**, pull in your clone directory:
 
@@ -61,6 +75,15 @@ curl -fsSL https://raw.githubusercontent.com/tanabee/awake/main/install.sh | bas
 The installer runs `git pull` on the existing checkout, so your local config (paths, symlink) is preserved.
 
 ### Uninstall
+
+Homebrew:
+
+```bash
+brew uninstall awake
+rm -rf ~/.local/state/awake   # PID file and logs (background mode)
+```
+
+Manual install:
 
 ```bash
 rm ~/.local/bin/awake
