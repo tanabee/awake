@@ -164,6 +164,16 @@ awake --help
 awake --version   # or: awake -v
 ```
 
+## Releasing (maintainers)
+
+Bump `AWAKE_VERSION` in `bin/awake`, commit, then run:
+
+```bash
+scripts/release.sh
+```
+
+It pushes `main`, creates and pushes the `vX.Y.Z` tag, and updates the Homebrew formula in `../homebrew-tap` with the new tarball URL and sha256.
+
 ## How it works
 
 1. A single `sudo` authentication at startup launches a small **root helper** process. The helper runs `pmset -a disablesleep 1` — disabling clamshell (lid-close) sleep on both AC and battery power — and then blocks on a FIFO held open by the main `awake` process.
